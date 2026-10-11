@@ -71,6 +71,40 @@ bool IsCpuConversionFormat(uint32_t format) {
            format == DRM_FORMAT_ABGR8888 || format == DRM_FORMAT_XBGR8888;
 }
 
+// Android HAL pixel format (graphics.common PixelFormat) to DRM fourcc.
+uint32_t HalToDrmFormat(int32_t hal_format) {
+    switch (hal_format) {
+        case 1:  // RGBA_8888
+            return DRM_FORMAT_ABGR8888;
+        case 2:  // RGBX_8888
+            return DRM_FORMAT_XBGR8888;
+        case 3:  // RGB_888
+            return DRM_FORMAT_BGR888;
+        case 4:  // RGB_565
+            return DRM_FORMAT_RGB565;
+        case 5:  // BGRA_8888
+            return DRM_FORMAT_ARGB8888;
+        default:
+            return 0;
+    }
+}
+
+uint32_t DrmFormatBytesPerPixel(uint32_t format) {
+    switch (format) {
+        case DRM_FORMAT_ARGB8888:
+        case DRM_FORMAT_XRGB8888:
+        case DRM_FORMAT_ABGR8888:
+        case DRM_FORMAT_XBGR8888:
+            return 4;
+        case DRM_FORMAT_BGR888:
+            return 3;
+        case DRM_FORMAT_RGB565:
+            return 2;
+        default:
+            return 0;
+    }
+}
+
 bool PathExists(const std::string& path) {
     std::error_code error;
     return fs::exists(path, error) && !error;
@@ -813,12 +847,43 @@ std::shared_ptr<DrmFramebuffer> DrmDevice::ImportBuffer(int64_t display, buffer_
     uint64_t width = 0;
     uint64_t height = 0;
     std::vector<android::ui::PlaneLayout> layouts;
-    if (mapper.getPixelFormatFourCC(imported, &format) != android::OK ||
-        mapper.getPixelFormatModifier(imported, &modifier) != android::OK ||
-        mapper.getWidth(imported, &width) != android::OK ||
-        mapper.getHeight(imported, &height) != android::OK ||
-        mapper.getPlaneLayouts(imported, &layouts) != android::OK || layouts.empty() ||
-        layouts.size() > kMaxPlanes || imported->numFds <= 0) {
+    if (mapper.getWidth(imported, &width) != android::OK ||
+        mapper.getHeight(imported, &height) != android::OK || imported->numFds <= 0) {
+        ALOGE("Incomplete standard mapper metadata for client target");
+        return nullptr;
+    }
+    // Older vendor mappers (gralloc4 from Android 11/12 GPU stacks) omit some
+    // standard metadata. Derive what scanout needs from the metadata they do have.
+    if (mapper.getPixelFormatFourCC(imported, &format) != android::OK || format == 0) {
+        android::ui::PixelFormat requested;
+        format = mapper.getPixelFormatRequested(imported, &requested) == android::OK
+                         ? HalToDrmFormat(static_cast<int32_t>(requested))
+                         : 0;
+        ALOGW_IF(!logged_metadata_fallback_, "Mapper lacks fourcc; using DRM format %08x", format);
+    }
+    if (mapper.getPixelFormatModifier(imported, &modifier) != android::OK) {
+        modifier = DRM_FORMAT_MOD_LINEAR;
+        ALOGW_IF(!logged_metadata_fallback_, "Mapper lacks modifier; assuming linear");
+    }
+    if (mapper.getPlaneLayouts(imported, &layouts) != android::OK || layouts.empty()) {
+        layouts.clear();
+        uint32_t stride = 0;
+        uint64_t size = 0;
+        const uint32_t bpp = DrmFormatBytesPerPixel(format);
+        if (bpp != 0 && mapper.getStride(imported, &stride) == android::OK && stride != 0 &&
+            mapper.getAllocationSize(imported, &size) == android::OK) {
+            android::ui::PlaneLayout layout{};
+            layout.strideInBytes = static_cast<int64_t>(stride) * bpp;
+            layout.totalSizeInBytes = static_cast<int64_t>(size);
+            layout.widthInSamples = static_cast<int64_t>(width);
+            layout.heightInSamples = static_cast<int64_t>(height);
+            layouts.push_back(layout);
+        }
+        ALOGW_IF(!logged_metadata_fallback_, "Mapper lacks plane layouts; synthesized %zu",
+                 layouts.size());
+    }
+    logged_metadata_fallback_ = true;
+    if (format == 0 || layouts.empty() || layouts.size() > kMaxPlanes) {
         ALOGE("Incomplete standard mapper metadata for client target");
         return nullptr;
     }
@@ -827,10 +892,31 @@ std::shared_ptr<DrmFramebuffer> DrmDevice::ImportBuffer(int64_t display, buffer_
         ALOGE("Invalid client target dimensions");
         return nullptr;
     }
-    uint64_t protected_content = 1;
-    bool cpu_compatible = layouts.size() == 1 && IsCpuConversionFormat(format) &&
-                          mapper.getProtectedContent(imported, &protected_content) == android::OK &&
-                          protected_content == 0;
+    // A mapper without the protected-content query cannot allocate protected buffers.
+    uint64_t protected_content = 0;
+    if (mapper.getProtectedContent(imported, &protected_content) != android::OK) {
+        protected_content = 0;
+    }
+    bool cpu_compatible =
+            layouts.size() == 1 && IsCpuConversionFormat(format) && protected_content == 0;
+    if (const uint32_t bpp = DrmFormatBytesPerPixel(format);
+        layouts.size() == 1 && bpp > 1 && layouts[0].strideInBytes >= static_cast<int64_t>(width) &&
+        layouts[0].strideInBytes < static_cast<int64_t>(width * bpp)) {
+        // Android 11/12 IMG mappers report the stride in pixels, not bytes.
+        layouts[0].strideInBytes *= bpp;
+    }
+    if (layouts.size() == 1 && layouts[0].totalSizeInBytes <= 0 && layouts[0].strideInBytes > 0) {
+        // Some vendor mappers report no plane size; a linear plane spans stride * height.
+        layouts[0].totalSizeInBytes = layouts[0].strideInBytes * static_cast<int64_t>(height);
+    }
+    ALOGI_IF(!logged_client_layout_,
+             "Client target %" PRIu64 "x%" PRIu64 " format %08x modifier %" PRIx64
+             " planes %zu stride %" PRId64 " offset %" PRId64 " size %" PRId64
+             " fds %d protected %" PRIu64,
+             width, height, format, modifier, layouts.size(), layouts[0].strideInBytes,
+             layouts[0].offsetInBytes, layouts[0].totalSizeInBytes, imported->numFds,
+             protected_content);
+    logged_client_layout_ = true;
     if (cpu_compatible) {
         const uint64_t row_bytes = width * 4;
         const auto& layout = layouts[0];
@@ -896,7 +982,11 @@ std::shared_ptr<DrmFramebuffer> DrmDevice::ImportBuffer(int64_t display, buffer_
         return fb;
     }
     auto try_cpu_staging = [&]() {
-        if (!cpu_conversion_enabled_ || !cpu_compatible) return false;
+        if (!cpu_conversion_enabled_ || !cpu_compatible) {
+            ALOGW("CPU staging unavailable (enabled=%d compatible=%d)", cpu_conversion_enabled_,
+                  cpu_compatible);
+            return false;
+        }
         if (atomic_kms_ &&
             !PlaneSupportsFormat(display_it->second, DRM_FORMAT_XRGB8888, DRM_FORMAT_MOD_LINEAR)) {
             return false;
@@ -904,6 +994,21 @@ std::shared_ptr<DrmFramebuffer> DrmDevice::ImportBuffer(int64_t display, buffer_
         return CreateCpuConversionFramebuffer(fb.get(), DRM_FORMAT_XRGB8888);
     };
     int fd_index = 0;
+    if (layouts.size() == 1 && imported->numFds > 1) {
+        // Some vendor handles (PowerVR) put metadata or sync fds before the pixel
+        // buffer; use the first dma-buf large enough to hold the plane.
+        const int64_t needed = layouts[0].offsetInBytes + layouts[0].totalSizeInBytes;
+        for (int i = 0; i < imported->numFds; ++i) {
+            const off_t size = lseek(imported->data[i], 0, SEEK_END);
+            if (size >= needed) {
+                fd_index = i;
+                break;
+            }
+        }
+        ALOGI_IF(fd_index != 0 && !logged_client_fd_, "Client target pixels are in fd %d of %d",
+                 fd_index, imported->numFds);
+        logged_client_fd_ = true;
+    }
     std::set<uint32_t> acquired_handles;
     for (size_t i = 0; i < layouts.size(); ++i) {
         if (layouts[i].strideInBytes <= 0 ||
