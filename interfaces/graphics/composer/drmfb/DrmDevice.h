@@ -196,6 +196,9 @@ class DrmDevice {
     bool syncobj_supported_ = false;
     bool swap_red_blue_ = false;
     bool cpu_conversion_enabled_ = true;
+    bool logged_metadata_fallback_ = false;
+    bool logged_client_layout_ = false;
+    bool logged_client_fd_ = false;
     bool firmware_kms_ = false;
     bool vboxvideo_ = false;
     bool qxl_ = false;
