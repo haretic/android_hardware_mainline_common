@@ -76,6 +76,7 @@ struct DrmDisplay {
     std::string name;
     std::string backlight_path;
     uint32_t backlight_max = 0;
+    uint32_t backlight_min = 1;
     bool backlight_power_down = false;
     std::vector<uint8_t> edid;
     std::vector<DrmConfig> configs;
