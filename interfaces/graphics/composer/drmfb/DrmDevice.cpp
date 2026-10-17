@@ -495,6 +495,7 @@ std::vector<DrmDevice::HotplugChange> DrmDevice::Rescan() {
         if (old != displays_.end()) {
             candidate.backlight_path = old->second.backlight_path;
             candidate.backlight_max = old->second.backlight_max;
+            candidate.backlight_min = old->second.backlight_min;
             candidate.backlight_power_down = old->second.backlight_power_down;
         }
         if (old != displays_.end() && was_connected) {
@@ -753,10 +754,15 @@ void DrmDevice::DiscoverBacklight() {
         !android::base::ParseUint(android::base::Trim(maximum), &max_value) || max_value == 0) {
         return;
     }
+    // Brightness 0 is the dimmest visible level, not off. Panels that go dark below a
+    // higher level than 1 set it in ro.vendor.drmfb.backlight_min.
+    const uint32_t min_value = android::base::GetUintProperty<uint32_t>(
+            "ro.vendor.drmfb.backlight_min", 1, max_value);
     internal_displays[0]->backlight_path = backlights[0];
     internal_displays[0]->backlight_max = max_value;
-    ALOGI("Display %" PRId64 " uses backlight %s max=%u", internal_displays[0]->id,
-          backlights[0].c_str(), max_value);
+    internal_displays[0]->backlight_min = min_value;
+    ALOGI("Display %" PRId64 " uses backlight %s min=%u max=%u", internal_displays[0]->id,
+          backlights[0].c_str(), min_value, max_value);
 }
 
 bool DrmDevice::PlaneSupportsFormat(const DrmDisplay& display, uint32_t format,
@@ -1449,9 +1455,13 @@ bool DrmDevice::SetBrightness(int64_t display, float brightness) {
     auto it = displays_.find(display);
     if (it == displays_.end() || !HasBrightness(display)) return false;
     DrmDisplay& drm_display = it->second;
-    const float normalized = brightness < 0.0F ? 0.0F : brightness;
+    // Composer brightness 0 is the minimum level; only -1 (power down below) is off.
+    const float normalized = std::clamp(brightness, 0.0F, 1.0F);
+    const uint32_t range = drm_display.backlight_max - drm_display.backlight_min;
     const uint32_t value =
-            static_cast<uint32_t>(std::lround(normalized * drm_display.backlight_max));
+            brightness < 0.0F ? 0
+                              : drm_display.backlight_min +
+                                        static_cast<uint32_t>(std::lround(normalized * range));
     if (!android::base::WriteStringToFile(std::to_string(value),
                                           drm_display.backlight_path + "/brightness")) {
         ALOGE("Failed to set display %" PRId64 " backlight to %u: %s", display, value,
