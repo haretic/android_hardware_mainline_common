@@ -806,10 +806,18 @@ int32_t ComposerClient::SetActiveConfigLocked(int64_t display, int32_t config,
     drmfb::DrmDisplay* drm_display = FindDisplayLocked(display);
     DisplayState* state = FindStateLocked(display);
     if (drm_display == nullptr || state == nullptr) return kBadDisplay;
-    if (FindConfig(*drm_display, config) == nullptr) return kBadConfig;
+    const drmfb::DrmConfig* requested = FindConfig(*drm_display, config);
+    if (requested == nullptr) return kBadConfig;
     if (drm_display->active_config == config) return 0;
+    const drmfb::DrmConfig* current = FindConfig(*drm_display, drm_display->active_config);
+    const bool same_size = current != nullptr &&
+                           current->mode.hdisplay == requested->mode.hdisplay &&
+                           current->mode.vdisplay == requested->mode.vdisplay;
     if (!drm_.SetActiveConfig(display, config)) return IComposerClient::EX_CONFIG_FAILED;
-    state->target_slots.assign(state->target_slots.size(), nullptr);
+    // SurfaceFlinger keeps sending cached client targets by slot alone. Buffers of the
+    // old size still fit a rate-only switch; dropping them left the display with no
+    // frame to present, so the deferred power-on never happened.
+    if (!same_size) state->target_slots.assign(state->target_slots.size(), nullptr);
     state->target.reset();
     state->target_full_damage = true;
     state->target_damage.clear();
