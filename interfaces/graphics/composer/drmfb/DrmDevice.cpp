@@ -574,8 +574,10 @@ bool DrmDevice::DiscoverConnector(uint32_t connector_id, DrmDisplay* display) {
             auto [it, inserted] = stable_config_ids_.emplace(key, next_config_id_);
             if (inserted) ++next_config_id_;
             config.id = it->second;
-            config.group =
-                    (static_cast<int32_t>(config.mode.hdisplay) << 16) | config.mode.vdisplay;
+            // A config group promises seamless switching. Applying a mode power-cycles the
+            // display, so every config is its own group and SurfaceFlinger never switches
+            // modes on its own to follow content.
+            config.group = config.id;
             display->configs.push_back(config);
             if (i == 0 || (config.mode.type & DRM_MODE_TYPE_PREFERRED) != 0) {
                 display->active_config = config.id;
