@@ -25,6 +25,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace aidl {
 namespace android {
@@ -91,6 +92,18 @@ struct UsbGadget : public BnUsbGadget {
     Status tearDownGadget();
     Status setupFunctions(int64_t functions, const shared_ptr<IUsbGadgetCallback>& callback,
                           uint64_t timeout, int64_t in_transactionId);
+    // Applies Android's functions, and the USB device emulator's while it holds some.
+    // Called with mLockSetCurrentFunction held.
+    Status applyFunctions(int64_t functions, const shared_ptr<IUsbGadgetCallback>& callback,
+                          int64_t timeout, int64_t in_transactionId);
+    Status applyOnce(int64_t functions, const shared_ptr<IUsbGadgetCallback>& callback,
+                     int64_t timeout, int64_t in_transactionId);
+    void watchEmulator();
+
+    // The emulator's request (sys.r1.usbemu.functions): its generation and functions
+    std::string mEmulatorGeneration;
+    std::vector<std::string> mEmulatorFunctions;
+    std::thread mEmulatorWatcher;
 };
 
 }  // namespace gadget

@@ -7,6 +7,7 @@
 #define LOG_TAG "android.hardware.usb.gadget.aidl-service"
 
 #include "UsbGadget.h"
+#include <ctype.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -17,6 +18,9 @@
 #include <unistd.h>
 
 #include <android-base/properties.h>
+#include <sys/system_properties.h>
+
+#include <algorithm>
 
 #include <aidl/android/frameworks/stats/IStats.h>
 
@@ -28,7 +32,60 @@ namespace gadget {
 
 using ::android::base::GetBoolProperty;
 using ::android::base::GetProperty;
+using ::android::base::Split;
+using ::android::base::StartsWith;
 using ::android::hardware::google::pixel::usb::kUvcEnabled;
+
+// The USB device emulator lends the gadget functions of its own, as a disc image or a sound
+// card, which it makes under functions/ itself:
+//   sys.r1.usbemu.functions  "<generation>:<function>,<function>" while it holds them, or
+//                            "none"; each function a <type>.usbemu<name> instance
+//   sys.r1.usbemu.id         "<vid>:<pid>" for the gadget while it holds them
+// Linked after Android's own, as adb, so Android keeps them. The answer goes to
+// vendor.r1.usbemu.state: "<generation> applied", "<generation> failed" (the gadget is back
+// to Android's functions alone), or "idle" once the functions are given back.
+static constexpr char kEmulatorFunctionsProp[] = "sys.r1.usbemu.functions";
+static constexpr char kEmulatorIdProp[] = "sys.r1.usbemu.id";
+static constexpr char kEmulatorStateProp[] = "vendor.r1.usbemu.state";
+// Long enough for adbd to write its descriptors again after the gadget was pulled down
+static constexpr int kEmulatorPullUpTimeoutMs = 3000;
+
+static bool isEmulatorFunction(const std::string& name) {
+    static const char* const kTypes[] = {"mass_storage", "uac2", "hid", "ffs", "acm", "ncm",
+                                         "rndis", "ecm"};
+    const size_t dot = name.find('.');
+    if (dot == std::string::npos || name.size() > 64 ||
+        !StartsWith(name.substr(dot + 1), "usbemu"))
+        return false;
+    for (unsigned char c : name)
+        if (!(islower(c) || isdigit(c) || c == '_' || c == '.')) return false;
+    const std::string type = name.substr(0, dot);
+    for (const char* t : kTypes)
+        if (type == t) return access((std::string(FUNCTIONS_PATH) + name).c_str(), F_OK) == 0;
+    return false;
+}
+
+// "none" or nothing: no functions. Anything malformed is refused whole.
+static bool parseEmulator(const std::string& value, std::string* generation,
+                          std::vector<std::string>* functions) {
+    generation->clear();
+    functions->clear();
+    if (value.empty() || value == "none") return true;
+    const size_t colon = value.find(':');
+    if (colon == 0 || colon == std::string::npos) return false;
+    *generation = value.substr(0, colon);
+    for (unsigned char c : *generation)
+        if (!isdigit(c)) return false;
+    for (const std::string& name : Split(value.substr(colon + 1), ",")) {
+        if (!isEmulatorFunction(name)) {
+            ALOGE("USB device emulator function refused: %s", name.c_str());
+            functions->clear();
+            return false;
+        }
+        functions->push_back(name);
+    }
+    return !functions->empty();
+}
 
 UsbGadget::UsbGadget() {
     if (kGadgetName.empty()) {
@@ -41,6 +98,33 @@ UsbGadget::UsbGadget() {
     }
 
     mMonitorFfs = new MonitorFfs(kGadgetName.c_str());
+    mCurrentUsbFunctions = GadgetFunction::NONE;
+    SetProperty(kEmulatorStateProp, "idle");
+    mEmulatorWatcher = std::thread(&UsbGadget::watchEmulator, this);
+}
+
+// Applies the emulator's functions as they change, Android's alone once given back
+void UsbGadget::watchEmulator() {
+    uint32_t serial = 0;
+    const prop_info* info = nullptr;
+    std::string seen = "none";
+    while (true) {
+        if (info == nullptr) {
+            // Not set yet: wait for any property till it is
+            __system_property_wait(nullptr, serial, &serial, nullptr);
+            info = __system_property_find(kEmulatorFunctionsProp);
+            if (info == nullptr) continue;
+            serial = 0;
+        }
+        if (!__system_property_wait(info, serial, &serial, nullptr)) continue;
+        std::string value = GetProperty(kEmulatorFunctionsProp, "none");
+        if (value == seen) continue;
+        seen = value;
+
+        std::unique_lock<std::mutex> lk(mLockSetCurrentFunction);
+        ALOGI("USB device emulator: %s", value.c_str());
+        applyFunctions(mCurrentUsbFunctions, nullptr, kEmulatorPullUpTimeoutMs, 0);
+    }
 }
 
 static inline std::string getUdcNodeHelper(const std::string path) {
@@ -232,6 +316,11 @@ Status UsbGadget::setupFunctions(int64_t functions, const shared_ptr<IUsbGadgetC
         if (linkFunction("ncm.gs9", i++)) return Status::ERROR;
     }
 
+    for (const std::string& function : mEmulatorFunctions) {
+        ALOGI("setCurrentUsbFunctions %s for the USB device emulator", function.c_str());
+        if (linkFunction(function.c_str(), i++)) return Status::ERROR;
+    }
+
     // Pull up the gadget right away when there are no ffs functions.
     if (!ffsEnabled) {
         if (!WriteStringToFile(kGadgetName, PULLUP_PATH)) return Status::ERROR;
@@ -265,10 +354,48 @@ ScopedAStatus UsbGadget::setCurrentUsbFunctions(int64_t functions,
                                                 const shared_ptr<IUsbGadgetCallback>& callback,
                                                 int64_t timeout, int64_t in_transactionId) {
     std::unique_lock<std::mutex> lk(mLockSetCurrentFunction);
-    std::string current_usb_power_operation_mode, current_usb_type;
-    std::string usb_limit_sink_enable;
-
     mCurrentUsbFunctions = functions;
+    if (applyFunctions(functions, callback, timeout, in_transactionId) != Status::SUCCESS)
+        return ScopedAStatus::fromServiceSpecificErrorWithMessage(
+                -1, "Usb Gadget setcurrent functions failed");
+    return ScopedAStatus::ok();
+}
+
+Status UsbGadget::applyFunctions(int64_t functions, const shared_ptr<IUsbGadgetCallback>& callback,
+                                 int64_t timeout, int64_t in_transactionId) {
+    const std::string value = GetProperty(kEmulatorFunctionsProp, "none");
+    if (!parseEmulator(value, &mEmulatorGeneration, &mEmulatorFunctions)) {
+        ALOGE("USB device emulator request refused: %s", value.c_str());
+        if (!mEmulatorGeneration.empty())
+            SetProperty(kEmulatorStateProp, mEmulatorGeneration + " failed");
+        mEmulatorGeneration.clear();
+        mEmulatorFunctions.clear();
+    }
+    if (mEmulatorFunctions.empty()) {
+        if (value == "none" || value.empty()) SetProperty(kEmulatorStateProp, "idle");
+        return applyOnce(functions, callback, timeout, in_transactionId);
+    }
+
+    // With the emulator's: Android's alone again, as adb, if the gadget can't take them
+    // all, as with too few endpoints for them, or the host never sees it
+    Status status = applyOnce(functions, nullptr, timeout, in_transactionId);
+    if (status == Status::SUCCESS && !mCurrentUsbFunctionsApplied &&
+        !mMonitorFfs->waitForPullUp(std::max<int64_t>(timeout, kEmulatorPullUpTimeoutMs)))
+        status = Status::ERROR;
+    if (status == Status::SUCCESS) {
+        SetProperty(kEmulatorStateProp, mEmulatorGeneration + " applied");
+        if (callback)
+            callback->setCurrentUsbFunctionsCb(functions, Status::SUCCESS, in_transactionId);
+        return Status::SUCCESS;
+    }
+    ALOGE("USB device emulator functions failed, back to Android's alone");
+    SetProperty(kEmulatorStateProp, mEmulatorGeneration + " failed");
+    mEmulatorFunctions.clear();
+    return applyOnce(functions, callback, timeout, in_transactionId);
+}
+
+Status UsbGadget::applyOnce(int64_t functions, const shared_ptr<IUsbGadgetCallback>& callback,
+                            int64_t timeout, int64_t in_transactionId) {
     mCurrentUsbFunctionsApplied = false;
 
     // Unlink the gadget and stop the monitor if running.
@@ -282,17 +409,31 @@ ScopedAStatus UsbGadget::setCurrentUsbFunctions(int64_t functions,
     // Leave the gadget pulled down to give time for the host to sense disconnect.
     usleep(kDisconnectWaitUs);
 
-    if (functions == GadgetFunction::NONE) {
-        if (callback == NULL)
-            return ScopedAStatus::fromServiceSpecificErrorWithMessage(-1, "callback == NULL");
+    if (functions == GadgetFunction::NONE && mEmulatorFunctions.empty()) {
+        if (callback == NULL) return Status::ERROR;
         ScopedAStatus ret = callback->setCurrentUsbFunctionsCb(functions, status, in_transactionId);
         if (!ret.isOk())
             ALOGE("Error while calling setCurrentUsbFunctionsCb %s", ret.getDescription().c_str());
-        return ScopedAStatus::fromServiceSpecificErrorWithMessage(
-                -1, "Error while calling setCurrentUsbFunctionsCb");
+        return Status::ERROR;
     }
 
-    status = validateAndSetVidPid(functions);
+    if (mEmulatorFunctions.empty()) {
+        status = validateAndSetVidPid(functions);
+    } else {
+        // The emulator's own id, and the device class composites with interface association
+        // descriptors take, as a sound card's or a serial port's
+        const std::vector<std::string> id =
+                Split(GetProperty(kEmulatorIdProp, "1d6b:0104"), ":");
+        status = id.size() == 2
+                         ? Status(::android::hardware::google::pixel::usb::setVidPid(
+                                   ("0x" + id[0]).c_str(), ("0x" + id[1]).c_str()))
+                         : Status::ERROR;
+        if (status == Status::SUCCESS &&
+            (!WriteStringToFile("0xEF", DEVICE_CLASS_PATH) ||
+             !WriteStringToFile("0x02", DEVICE_SUB_CLASS_PATH) ||
+             !WriteStringToFile("0x01", DEVICE_PROTOCOL_PATH)))
+            status = Status::ERROR;
+    }
 
     if (status != Status::SUCCESS) {
         goto error;
@@ -304,18 +445,15 @@ ScopedAStatus UsbGadget::setCurrentUsbFunctions(int64_t functions,
     }
 
     ALOGI("Usb Gadget setcurrent functions called successfully");
-    return ScopedAStatus::ok();
+    return Status::SUCCESS;
 
 error:
     ALOGI("Usb Gadget setcurrent functions failed");
-    if (callback == NULL)
-        return ScopedAStatus::fromServiceSpecificErrorWithMessage(
-                -1, "Usb Gadget setcurrent functions failed");
+    if (callback == NULL) return Status::ERROR;
     ScopedAStatus ret = callback->setCurrentUsbFunctionsCb(functions, status, in_transactionId);
     if (!ret.isOk())
         ALOGE("Error while calling setCurrentUsbFunctionsCb %s", ret.getDescription().c_str());
-    return ScopedAStatus::fromServiceSpecificErrorWithMessage(
-            -1, "Error while calling setCurrentUsbFunctionsCb");
+    return Status::ERROR;
 }
 }  // namespace gadget
 }  // namespace usb
