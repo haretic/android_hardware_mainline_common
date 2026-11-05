@@ -112,10 +112,9 @@ bool ComposerClient::Init() {
     if (!drm_.Init(drm_path_)) return false;
     for (const auto& [id, display] : drm_.displays()) {
         if (!display.connected) continue;
-        if (display.powered && !drm_.SetPower(id, false)) {
-            ALOGE("Failed to establish initial OFF state for display %" PRId64, id);
-            return false;
-        }
+        // A display the kernel (or a previous client) left lit stays lit: SurfaceFlinger powers
+        // it on as it connects anyway, and the first present flips onto it without a modeset.
+        // Turning it off here blanked the panel until that first frame.
         states_.emplace(id, DisplayState{});
     }
     wake_fd_.reset(eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
