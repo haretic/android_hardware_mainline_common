@@ -21,6 +21,7 @@
 #include "routing/PcmArbiter.h"
 #include "routing/RoutingController.h"
 #include "stream/NullDevice.h"
+#include "stream/SpeakerBoost.h"
 
 namespace aidl::android::hardware::audio::core::mainline {
 
@@ -111,6 +112,8 @@ class StreamMainline : public StreamCommonImpl {
     // True when every endpoint is either null or deferred, i.e. the stream
     // plays into the null device.
     bool OnNullPath() const;
+    // True when the stream plays into the built-in speaker and nothing else.
+    bool OnSpeakerOnly() const;
     ::android::status_t TransferOutput(void* buffer, size_t frame_count, int32_t* latency_ms);
     ::android::status_t TransferInput(void* buffer, size_t frame_count, int32_t* latency_ms);
     alsa::PcmConfig MakePcmConfig() const;
@@ -152,6 +155,8 @@ class StreamMainline : public StreamCommonImpl {
     // every endpoint is deferred.
     bool pcms_opened_ = false;
     NullDevice null_device_;
+    // Worker thread only.
+    SpeakerBoost speaker_boost_;
     bool null_running_ = false;
     // Highest frame position reported for an input stream, which never goes
     // back (refinePosition()).
