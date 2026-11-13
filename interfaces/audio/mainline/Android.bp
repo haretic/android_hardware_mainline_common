@@ -67,6 +67,7 @@ cc_binary {
         "routing/PcmArbiter.cpp",
         "routing/RoutingController.cpp",
         "stream/NullDevice.cpp",
+        "stream/SpeakerBoost.cpp",
         "stream/StreamMainline.cpp",
         "ucm/UcmDeviceMapper.cpp",
         "ucm/UcmManager.cpp",

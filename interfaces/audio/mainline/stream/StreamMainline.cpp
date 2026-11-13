@@ -26,6 +26,7 @@ using ::aidl::android::hardware::audio::common::isBitPositionFlagSet;
 using ::aidl::android::hardware::audio::common::SinkMetadata;
 using ::aidl::android::hardware::audio::common::SourceMetadata;
 using ::aidl::android::media::audio::common::AudioDevice;
+using ::aidl::android::media::audio::common::AudioDeviceType;
 using ::aidl::android::media::audio::common::AudioIoFlags;
 using ::aidl::android::media::audio::common::AudioOffloadInfo;
 using ::aidl::android::media::audio::common::AudioOutputFlags;
@@ -345,8 +346,14 @@ void StreamMainline::ReopenDeferredPcms() {
     }
 }
 
+bool StreamMainline::OnSpeakerOnly() const {
+    return active_endpoints_.size() == 1 && !active_endpoints_.front().IsNull() &&
+           active_endpoints_.front().device.type.type == AudioDeviceType::OUT_SPEAKER;
+}
+
 void StreamMainline::ClosePcms() {
     if (passthrough_ != nullptr) passthrough_->Close();
+    speaker_boost_.Reset();
     pcms_.clear();
     deferred_endpoints_.clear();
     pcms_opened_ = false;
@@ -480,6 +487,7 @@ void StreamMainline::ApplyPendingEndpoints() {
 
 ::android::status_t StreamMainline::flush() {
     if (passthrough_ != nullptr) passthrough_->Flush();
+    speaker_boost_.Reset();
     for (auto& open : pcms_) {
         open.pcm->Drop();
         open.pcm->Prepare();
@@ -501,6 +509,10 @@ void StreamMainline::ApplyPendingEndpoints() {
     const snd_pcm_format_t format = *alsa_format_;
     alsa::ApplyGain(buffer, frame_count, channel_count_, format,
                     gain_.load(std::memory_order_relaxed));
+    if (OnSpeakerOnly()) {
+        speaker_boost_.Process(buffer, frame_count, channel_count_, format,
+                               static_cast<unsigned int>(getContext().getSampleRate()));
+    }
     alsa::ReorderChannelsAndroidToAlsa(buffer, frame_count, channel_count_, format,
                                        getContext().getChannelLayout());
     int32_t latency = 0;
