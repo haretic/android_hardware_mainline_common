@@ -9,6 +9,7 @@
 
 #include <android-base/logging.h>
 #include <android-base/parsedouble.h>
+#include <android-base/properties.h>
 #include <android-base/stringprintf.h>
 #include <libsensors_common/SensorEvents.h>
 #include <libsensors_common/SensorTypes.h>
@@ -211,6 +212,28 @@ void IioSensor::ResolveMountMatrix() {
             LOG(WARNING) << info_.name << ": invalid mount matrix '" << *text << "' from " << source
                          << ", using identity";
             source = "identity (invalid " + source + ")";
+        }
+    }
+    // Compose after the mounting calibration so both accelerometer and gyroscope
+    // report vectors in the natural display basis before composite sensors run.
+    const auto orientation_property = GetSetting("display_orientation_property");
+    if (orientation_property.has_value()) {
+        const int offset = ::android::base::GetIntProperty(*orientation_property, 0);
+        if (offset == 90 || offset == 180 || offset == 270) {
+            const MountMatrix mounted = mount_matrix_;
+            for (int col = 0; col < 3; col++) {
+                if (offset == 90) {
+                    mount_matrix_.at(0, col) = -mounted.at(1, col);
+                    mount_matrix_.at(1, col) = mounted.at(0, col);
+                } else if (offset == 180) {
+                    mount_matrix_.at(0, col) = -mounted.at(0, col);
+                    mount_matrix_.at(1, col) = -mounted.at(1, col);
+                } else {
+                    mount_matrix_.at(0, col) = mounted.at(1, col);
+                    mount_matrix_.at(1, col) = -mounted.at(0, col);
+                }
+            }
+            source += " + display orientation " + std::to_string(offset);
         }
     }
     LOG(INFO) << info_.name << ": mount matrix [" << mount_matrix_.ToString() << "] from "
