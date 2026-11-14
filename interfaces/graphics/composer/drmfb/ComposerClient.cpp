@@ -12,6 +12,7 @@
 #include <aidl/android/hardware/graphics/composer3/PresentFence.h>
 #include <aidl/android/hardware/graphics/composer3/PresentOrValidate.h>
 #include <aidlcommonsupport/NativeHandle.h>
+#include <android-base/properties.h>
 #include <android-base/stringprintf.h>
 #include <android/binder_ibinder_platform.h>
 #include <cutils/native_handle.h>
@@ -712,7 +713,12 @@ ndk::ScopedAStatus ComposerClient::getDisplayPhysicalOrientation(int64_t display
     std::lock_guard lock(mutex_);
     const drmfb::DrmDisplay* drm_display = FindDisplayLocked(display);
     if (drm_display == nullptr) return Error(kBadDisplay);
-    switch (drm_display->orientation_degrees) {
+    int offset = 0;
+    if (drm_display->internal) {
+        offset = ::android::base::GetIntProperty("ro.vendor.display.primary_orientation", 0);
+        if (offset != 90 && offset != 180 && offset != 270) offset = 0;
+    }
+    switch ((drm_display->orientation_degrees + offset) % 360) {
         case 90:
             *orientation = common::Transform::ROT_90;
             break;
