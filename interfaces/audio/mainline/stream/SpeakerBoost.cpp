@@ -41,6 +41,17 @@ const std::string& GainProperty() {
 int GainFromProperty() {
     return ::android::base::GetIntProperty(GainProperty(), 0, 0, 100);
 }
+
+const std::string& ToneProperty() {
+    static const std::string name =
+            ::android::base::GetProperty(Key("speaker_tone.property"), "");
+    return name;
+}
+
+bool ToneFromProperty() {
+    // A device that names a switch has the correction off until the switch says on.
+    return ToneProperty().empty() || ::android::base::GetBoolProperty(ToneProperty(), false);
+}
 #endif
 
 }  // namespace
@@ -48,12 +59,20 @@ int GainFromProperty() {
 #ifdef __ANDROID__
 SpeakerBoost::SpeakerBoost()
     : SpeakerBoost(GainProperty().empty() ? nullptr : &GainFromProperty,
-                   ::android::base::GetIntProperty(Key("speaker_boost.max_db"), 6, 0, 24)) {}
+                   ::android::base::GetIntProperty(Key("speaker_boost.max_db"), 6, 0, 24),
+                   ::android::base::GetProperty(Key("speaker_tone.filters"), ""),
+                   &ToneFromProperty) {}
 #else
 SpeakerBoost::SpeakerBoost() = default;
 #endif
 
 SpeakerBoost::SpeakerBoost(GainSource source, int max_db) : source_(source), max_db_(max_db) {}
+
+SpeakerBoost::SpeakerBoost(GainSource source, int max_db, const std::string& tone,
+                           ToneSource tone_on)
+    : source_(source), max_db_(max_db) {
+    if (tone_.Describe(tone)) tone_source_ = tone_on;
+}
 
 void SpeakerBoost::Reset() {
     std::fill(line_.begin(), line_.end(), 0.0f);
@@ -62,6 +81,8 @@ void SpeakerBoost::Reset() {
     envelope_ = 1.0f;
     applied_ = 1.0f;
     gain_ = target_gain_;
+    tone_.Reset();
+    tone_mix_ = tone_target_;
 }
 
 void SpeakerBoost::Configure(unsigned int channels, unsigned int rate) {
@@ -75,6 +96,7 @@ void SpeakerBoost::Configure(unsigned int channels, unsigned int rate) {
     release_ = 1.0f - std::exp(-1.0f / (rate * kReleaseMs / 1000.0f));
     gain_step_ = 1.0f / (rate * kGainRampMs / 1000.0f);
     frames_to_poll_ = 0;
+    tone_.Configure(channels, rate);
     Reset();
 }
 
@@ -89,11 +111,17 @@ void SpeakerBoost::Run(T* data, size_t frames, float full_scale) {
             gain_ = gain_ < target_gain_ ? std::min(gain_ + step, target_gain_)
                                          : std::max(gain_ - step, target_gain_);
         }
+        if (tone_mix_ != tone_target_) {
+            tone_mix_ = tone_mix_ < tone_target_ ? std::min(tone_mix_ + gain_step_, tone_target_)
+                                                 : std::max(tone_mix_ - gain_step_, tone_target_);
+        }
         T* frame = data + f * channels_;
         float* held = line_.data() + line_pos_ * channels_;
         float peak = 0.0f;
         for (unsigned int c = 0; c < channels_; ++c) {
-            const float in = static_cast<float>(frame[c]) * inverse * gain_;
+            float in = static_cast<float>(frame[c]) * inverse;
+            if (tone_mix_ > 0.0f) in += (tone_.Run(c, in) - in) * tone_mix_;
+            in *= gain_;
             peak = std::max(peak, std::fabs(in));
             // The frame that entered lookahead_ frames ago leaves now.
             const float out = held[c];
@@ -127,7 +155,8 @@ void SpeakerBoost::Run(T* data, size_t frames, float full_scale) {
 
 void SpeakerBoost::Process(void* buffer, size_t frames, unsigned int channels,
                            snd_pcm_format_t format, unsigned int rate) {
-    if (source_ == nullptr || buffer == nullptr || frames == 0 || channels == 0 || rate == 0) {
+    if ((source_ == nullptr && tone_source_ == nullptr) || buffer == nullptr || frames == 0 ||
+        channels == 0 || rate == 0) {
         return;
     }
     if (format != SND_PCM_FORMAT_S16_LE && format != SND_PCM_FORMAT_S32_LE &&
@@ -135,14 +164,18 @@ void SpeakerBoost::Process(void* buffer, size_t frames, unsigned int channels,
         return;
     }
     if (frames_to_poll_ <= frames) {
-        const int db = std::clamp(source_(), 0, max_db_);
+        const int db = source_ == nullptr ? 0 : std::clamp(source_(), 0, max_db_);
         target_gain_ = std::pow(10.0f, static_cast<float>(db) / 20.0f);
+        const float tone = tone_source_ != nullptr && tone_source_() ? 1.0f : 0.0f;
+        // Coming on, the filters start from silence rather than from where they stopped.
+        if (tone > tone_target_ && tone_mix_ == 0.0f) tone_.Reset();
+        tone_target_ = tone;
         frames_to_poll_ = static_cast<size_t>(rate) * kPollMs / 1000;
     } else {
         frames_to_poll_ -= frames;
     }
     const bool idle = target_gain_ == 1.0f && gain_ == 1.0f && line_fill_ == 0 &&
-                      applied_ > 0.999f;
+                      applied_ > 0.999f && tone_target_ == 0.0f && tone_mix_ == 0.0f;
     if (idle) {
         // Nothing to add and nothing held back: the stream passes as it is,
         // without the look-ahead's delay.

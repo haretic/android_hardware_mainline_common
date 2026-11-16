@@ -68,6 +68,7 @@ cc_binary {
         "routing/RoutingController.cpp",
         "stream/NullDevice.cpp",
         "stream/SpeakerBoost.cpp",
+        "stream/SpeakerTone.cpp",
         "stream/StreamMainline.cpp",
         "ucm/UcmDeviceMapper.cpp",
         "ucm/UcmManager.cpp",
