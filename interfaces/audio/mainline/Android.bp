@@ -105,6 +105,12 @@ cc_binary {
 
 // --- Files installed into the APEX ------------------------------------------
 
+linker_config {
+    name: "com.android.hardware.audio.mainline-linker-config",
+    src: "apex_linkerconfig.json",
+    installable: false,
+}
+
 prebuilt_etc {
     name: "android.hardware.audio.service-aidl.mainline.rc",
     src: "android.hardware.audio.service-aidl.mainline.rc",
@@ -227,6 +233,7 @@ apex {
         default: [],
     }),
     prebuilts: [
+        "com.android.hardware.audio.mainline-linker-config",
         "android.hardware.audio.service-aidl.mainline.rc",
         "android.hardware.audio.service-aidl.mainline.xml",
         "audio_policy_engine_configuration.mainline.xml",
