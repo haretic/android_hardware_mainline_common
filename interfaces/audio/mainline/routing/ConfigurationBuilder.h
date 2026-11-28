@@ -22,6 +22,10 @@ inline constexpr const char* kPassthroughOutputMixPort = "hdmi passthrough";
 inline constexpr const char* kPrimaryInputMixPort = "primary input";
 inline constexpr const char* kUsbOutputMixPort = "usb output";
 inline constexpr const char* kUsbInputMixPort = "usb input";
+// A call's voice to and from the modem when AudioFlinger bridges it (the other
+// end on another module or card: Bluetooth, USB).
+inline constexpr const char* kTelephonyTxMixPort = "telephony tx";
+inline constexpr const char* kTelephonyRxMixPort = "telephony rx";
 
 inline constexpr uint32_t kHraOutputCutoff = 88200;
 

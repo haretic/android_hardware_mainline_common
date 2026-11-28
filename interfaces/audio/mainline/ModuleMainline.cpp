@@ -26,9 +26,11 @@ namespace aidl::android::hardware::audio::core::mainline {
 using ::aidl::android::hardware::audio::common::isBitPositionFlagSet;
 using ::aidl::android::hardware::audio::common::SinkMetadata;
 using ::aidl::android::hardware::audio::common::SourceMetadata;
+using ::aidl::android::media::audio::common::AudioChannelLayout;
 using ::aidl::android::media::audio::common::AudioDevice;
 using ::aidl::android::media::audio::common::AudioDeviceDescription;
 using ::aidl::android::media::audio::common::AudioFormatDescription;
+using ::aidl::android::media::audio::common::AudioFormatType;
 using ::aidl::android::media::audio::common::AudioIoFlags;
 using ::aidl::android::media::audio::common::AudioOffloadInfo;
 using ::aidl::android::media::audio::common::AudioOutputFlags;
@@ -113,8 +115,22 @@ ModuleMainline::ModuleMainline(std::unique_ptr<Configuration>&& config,
       hbr_failures_(std::make_shared<passthrough::HbrFailures>()),
       hdmi_control_factory_(MakeHdmiControlFactory(inventory_, hbr_failures_)),
       forced_passthrough_formats_(ParseFormatList(properties.hdmi_passthrough_formats)),
-      passthrough_port_id_(FindMixPort(routing::kPassthroughOutputMixPort)) {
-    LOG(INFO) << __func__ << ": module ready";
+      passthrough_port_id_(FindMixPort(routing::kPassthroughOutputMixPort)),
+      telephony_device_ports_(FindTelephonyDevicePorts()),
+      call_(std::make_shared<telephony::CallState>(
+              telephony_device_ports_.empty() ? "" : properties.telephony_property)),
+      telephony_(telephony_device_ports_.empty()
+                         ? nullptr
+                         : ndk::SharedRefBase::make<telephony::TelephonyMainline>(call_)) {
+    LOG(INFO) << __func__ << ": module ready" << (telephony_ != nullptr ? ", with telephony" : "");
+}
+
+std::set<int32_t> ModuleMainline::FindTelephonyDevicePorts() const {
+    std::set<int32_t> ports;
+    for (const routing::Endpoint& e : inventory_->endpoints()) {
+        if (routing::IsTelephonyRole(e.role)) ports.insert(e.port_id);
+    }
+    return ports;
 }
 
 int32_t ModuleMainline::FindMixPort(const char* name) {
@@ -146,8 +162,9 @@ StreamDeps ModuleMainline::MakeStreamDeps() const {
 // --- Optional sub-interfaces -------------------------------------------------
 
 ndk::ScopedAStatus ModuleMainline::getTelephony(std::shared_ptr<ITelephony>* _aidl_return) {
-    // Voice calls need modem specific plumbing that a generic HAL can not offer.
-    *_aidl_return = nullptr;
+    // Only with a modem's voice PCMs (a UCM "Telephony" device); what drives the
+    // modem itself follows telephony.property.
+    *_aidl_return = telephony_;
     return ndk::ScopedAStatus::ok();
 }
 
@@ -203,7 +220,142 @@ ndk::ScopedAStatus ModuleMainline::setMicMute(bool in_mute) {
     // Applied by the input streams: captured data is replaced by silence.
     LOG(INFO) << __func__ << ": " << in_mute;
     mic_muted_->store(in_mute, std::memory_order_relaxed);
+    // In a call bridged in hardware the mic goes to the modem without a stream
+    if (telephony_ != nullptr) call_->SetMicMute(in_mute);
     return ndk::ScopedAStatus::ok();
+}
+
+// --- Calls -----------------------------------------------------------------------
+
+void ModuleMainline::CompleteDevicePortConfigs(const AudioPatch& patch) {
+    auto& configs = getConfig().portConfigs;
+    auto& ports = getConfig().ports;
+    for (const auto& ids : {patch.sourcePortConfigIds, patch.sinkPortConfigIds}) {
+        for (const int32_t id : ids) {
+            const auto config = findById<AudioPortConfig>(configs, id);
+            if (config == configs.end() || config->ext.getTag() != AudioPortExt::Tag::device) {
+                continue;
+            }
+            if (config->format.has_value() && config->format->type == AudioFormatType::PCM &&
+                config->sampleRate.has_value() && config->sampleRate->value > 0 &&
+                config->channelMask.has_value() &&
+                config->channelMask->getTag() != AudioChannelLayout::Tag::none) {
+                continue;
+            }
+            const auto port = findById<AudioPort>(ports, config->portId);
+            if (port == ports.end() || port->profiles.empty()) continue;
+            // The rate the card is most likely to run at already: 48 kHz if it can
+            for (const AudioProfile& profile : port->profiles) {
+                if (profile.format.type != AudioFormatType::PCM || profile.channelMasks.empty() ||
+                    profile.sampleRates.empty()) {
+                    continue;
+                }
+                const auto rate = std::find(profile.sampleRates.begin(), profile.sampleRates.end(),
+                                            48000);
+                config->format = profile.format;
+                config->channelMask = profile.channelMasks.front();
+                config->sampleRate = Int{.value = rate != profile.sampleRates.end()
+                                                          ? 48000
+                                                          : profile.sampleRates.front()};
+                LOG(DEBUG) << __func__ << ": port config " << id << " of \"" << port->name
+                           << "\" at " << config->sampleRate->value << " Hz";
+                break;
+            }
+        }
+    }
+}
+
+ndk::ScopedAStatus ModuleMainline::setAudioPatch(const AudioPatch& in_requested,
+                                                 AudioPatch* _aidl_return) {
+    if (telephony_device_ports_.empty()) return Module::setAudioPatch(in_requested, _aidl_return);
+
+    // Is it a call's, and does it bridge the call in hardware (no mix port)?
+    bool for_call = false;
+    bool from_modem = false;
+    bool device_only = true;
+    std::vector<int32_t> device_ports;
+    {
+        auto& configs = getConfig().portConfigs;
+        for (const auto* ids : {&in_requested.sourcePortConfigIds, &in_requested.sinkPortConfigIds}) {
+            for (const int32_t id : *ids) {
+                const auto config = findById<AudioPortConfig>(configs, id);
+                if (config == configs.end()) continue;  // Module rejects it
+                if (config->ext.getTag() != AudioPortExt::Tag::device) {
+                    device_only = false;
+                    continue;
+                }
+                if (telephony_device_ports_.count(config->portId) > 0) {
+                    for_call = true;
+                    if (ids == &in_requested.sourcePortConfigIds) from_modem = true;
+                } else {
+                    device_ports.push_back(config->portId);
+                }
+            }
+        }
+    }
+    if (for_call && device_only) CompleteDevicePortConfigs(in_requested);
+
+    if (auto status = Module::setAudioPatch(in_requested, _aidl_return); !status.isOk()) {
+        return status;
+    }
+
+    std::lock_guard guard(call_lock_);
+    // An update: the new patch's devices are held before the old ones go, so a
+    // device the two share stays on
+    std::optional<CallPatch> old;
+    if (const auto it = call_patches_.find(_aidl_return->id); it != call_patches_.end()) {
+        old = std::move(it->second);
+        call_patches_.erase(it);
+    }
+    if (for_call) {
+        CallPatch patch{.in_hardware = device_only, .from_modem = from_modem};
+        if (device_only) {
+            for (const int32_t port_id : device_ports) {
+                if (const routing::Endpoint* e = inventory_->FindByPortId(port_id); e != nullptr) {
+                    routing_->Acquire(*e);
+                    patch.held.push_back(e);
+                }
+            }
+        }
+        LOG(INFO) << __func__ << ": call patch " << _aidl_return->id << " "
+                  << (device_only ? "in hardware" : "through the telephony PCMs") << ", "
+                  << patch.held.size() << " device(s) held";
+        call_patches_[_aidl_return->id] = std::move(patch);
+    }
+    if (old.has_value()) {
+        for (const routing::Endpoint* e : old->held) routing_->Release(*e);
+    }
+    UpdateCallRoute();
+    return ndk::ScopedAStatus::ok();
+}
+
+ndk::ScopedAStatus ModuleMainline::resetAudioPatch(int32_t in_patchId) {
+    if (auto status = Module::resetAudioPatch(in_patchId); !status.isOk()) return status;
+    if (telephony_device_ports_.empty()) return ndk::ScopedAStatus::ok();
+    std::lock_guard guard(call_lock_);
+    if (const auto it = call_patches_.find(in_patchId); it != call_patches_.end()) {
+        for (const routing::Endpoint* e : it->second.held) routing_->Release(*e);
+        LOG(INFO) << __func__ << ": call patch " << in_patchId << " gone";
+        call_patches_.erase(it);
+        UpdateCallRoute();
+    }
+    return ndk::ScopedAStatus::ok();
+}
+
+void ModuleMainline::UpdateCallRoute() {
+    using Route = telephony::CallState::Route;
+    // In the card when a patch joins the modem to a device of it. Bridged when
+    // the modem's downlink is captured: the uplink's mix port alone is no call,
+    // the policy keeps that one patched at all times.
+    Route route = Route::kOff;
+    for (const auto& [id, patch] : call_patches_) {
+        if (patch.in_hardware) {
+            route = Route::kCodec;
+            break;
+        }
+        if (patch.from_modem) route = Route::kBridge;
+    }
+    call_->SetRoute(route);
 }
 
 ndk::ScopedAStatus ModuleMainline::getSupportedPlaybackRateFactors(
@@ -456,6 +608,7 @@ binder_status_t ModuleMainline::dump(int fd, const char** args, uint32_t num_arg
     text += inventory_->Dump();
     text += routing_->Dump();
     text += pcm_arbiter_->Dump();
+    if (telephony_ != nullptr) text += call_->Dump();
     ::android::base::WriteStringToFd(text, fd);
     return Module::dump(fd, args, num_args);
 }

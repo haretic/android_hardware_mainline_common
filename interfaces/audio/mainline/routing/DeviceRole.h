@@ -27,11 +27,13 @@ enum class DeviceRole {
     kMic,         // IN_MICROPHONE, attached, default input
     kHeadsetMic,  // IN_HEADSET / analog, external template
     kBusIn,       // IN_BUS, attached, addressed (line in, extra mics, ...)
+    kTelephonyTx,  // OUT_TELEPHONY_TX, attached: to the modem (a call's uplink)
+    kTelephonyRx,  // IN_TELEPHONY_RX, attached: from the modem (a call's downlink)
 };
 
 inline bool IsInputRole(DeviceRole role) {
     return role == DeviceRole::kMic || role == DeviceRole::kHeadsetMic ||
-           role == DeviceRole::kBusIn;
+           role == DeviceRole::kBusIn || role == DeviceRole::kTelephonyRx;
 }
 
 // Roles that end up as external (template) device ports.
@@ -47,6 +49,10 @@ inline bool IsExternalRole(DeviceRole role) {
         default:
             return false;
     }
+}
+
+inline bool IsTelephonyRole(DeviceRole role) {
+    return role == DeviceRole::kTelephonyTx || role == DeviceRole::kTelephonyRx;
 }
 
 inline const char* ToString(DeviceRole role) {
@@ -73,6 +79,10 @@ inline const char* ToString(DeviceRole role) {
             return "HeadsetMic";
         case DeviceRole::kBusIn:
             return "BusIn";
+        case DeviceRole::kTelephonyTx:
+            return "TelephonyTx";
+        case DeviceRole::kTelephonyRx:
+            return "TelephonyRx";
     }
     return "?";
 }

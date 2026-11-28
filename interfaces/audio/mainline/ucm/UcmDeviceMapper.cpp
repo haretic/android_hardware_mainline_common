@@ -43,7 +43,10 @@ DeviceRole ClassifyUcmDevice(const std::string& name, bool playback) {
     const std::string n = Normalize(name);
     DeviceRole role;
 
-    if (!playback) {
+    if (StartsWith(n, "telephony") || StartsWith(n, "modem") || StartsWith(n, "voicecall")) {
+        // The PCMs to and from a modem's voice: playback is the call's uplink
+        role = playback ? DeviceRole::kTelephonyTx : DeviceRole::kTelephonyRx;
+    } else if (!playback) {
         if (Contains(n, "headsetmic") || Contains(n, "headphonemic") || Contains(n, "hsmic") ||
             Contains(n, "headset")) {
             role = DeviceRole::kHeadsetMic;

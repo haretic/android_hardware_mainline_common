@@ -94,6 +94,10 @@ std::string DefaultName(DeviceRole role) {
             return "Built-In Mic";
         case DeviceRole::kHeadsetMic:
             return "Headset Mic";
+        case DeviceRole::kTelephonyTx:
+            return "Telephony Tx";
+        case DeviceRole::kTelephonyRx:
+            return "Telephony Rx";
         default:
             return "";
     }
@@ -186,6 +190,7 @@ std::shared_ptr<DeviceInventory> DeviceInventory::Discover(const Properties& pro
     inventory->ProbeCapabilities();
     inventory->FilterCapabilities();
     inventory->AssignRoles();
+    inventory->KeepTelephonyIfComplete(properties.telephony);
     inventory->AddNullEndpointsIfNeeded(properties.null_mic);
     inventory->FinalizeEndpoints();
     LOG(INFO) << inventory->Dump();
@@ -437,6 +442,8 @@ void DeviceInventory::AssignRoles() {
     bool have_speaker = false;
     bool have_earpiece = false;
     bool have_mic = false;
+    bool have_telephony_tx = false;
+    bool have_telephony_rx = false;
     std::set<DeviceRole> used_templates;
     // HDMI / DisplayPort heads beyond the first one become bus outputs; they
     // must not be promoted to the speaker below any more than the first one.
@@ -479,6 +486,18 @@ void DeviceInventory::AssignRoles() {
                     e.role = e.is_input ? DeviceRole::kBusIn : DeviceRole::kBusOut;
                 }
                 break;
+            case DeviceRole::kTelephonyTx:
+            case DeviceRole::kTelephonyRx: {
+                // One modem: the primary card's. Another card's voice PCMs are plain buses.
+                bool& have = e.role == DeviceRole::kTelephonyTx ? have_telephony_tx
+                                                                : have_telephony_rx;
+                if (on_primary && !have) {
+                    have = true;
+                } else {
+                    e.role = e.is_input ? DeviceRole::kBusIn : DeviceRole::kBusOut;
+                }
+                break;
+            }
             case DeviceRole::kBusOut:
             case DeviceRole::kBusIn:
                 break;
@@ -529,6 +548,19 @@ void DeviceInventory::AssignRoles() {
     for (Endpoint& promoted : promoted_endpoints) {
         endpoints_.push_back(std::move(promoted));
     }
+}
+
+void DeviceInventory::KeepTelephonyIfComplete(bool enabled) {
+    const auto count = [this](DeviceRole role) {
+        return std::count_if(endpoints_.begin(), endpoints_.end(),
+                             [role](const Endpoint& e) { return e.role == role; });
+    };
+    const bool complete = count(DeviceRole::kTelephonyTx) > 0 && count(DeviceRole::kTelephonyRx) > 0;
+    if (enabled && complete) return;
+    if (count(DeviceRole::kTelephonyTx) + count(DeviceRole::kTelephonyRx) == 0) return;
+    LOG(WARNING) << __func__ << ": not exposing the telephony device: "
+                 << (enabled ? "it needs both a playback and a capture PCM" : "telephony=false");
+    std::erase_if(endpoints_, [](const Endpoint& e) { return IsTelephonyRole(e.role); });
 }
 
 void DeviceInventory::AddNullEndpointsIfNeeded(bool null_mic) {
@@ -607,6 +639,12 @@ void DeviceInventory::FinalizeEndpoints() {
                 break;
             case DeviceRole::kBusIn:
                 e.device = MakeDevice(AudioDeviceType::IN_BUS, "", bus_address);
+                break;
+            case DeviceRole::kTelephonyTx:
+                e.device = MakeDevice(AudioDeviceType::OUT_TELEPHONY_TX);
+                break;
+            case DeviceRole::kTelephonyRx:
+                e.device = MakeDevice(AudioDeviceType::IN_TELEPHONY_RX);
                 break;
         }
         e.profiles = alsa::ProfilesFromCapabilities(e.caps, e.is_input);

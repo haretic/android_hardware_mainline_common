@@ -112,6 +112,8 @@ class StreamMainline : public StreamCommonImpl {
     // True when every endpoint is either null or deferred, i.e. the stream
     // plays into the null device.
     bool OnNullPath() const;
+    // Capture of a call's downlink (the modem's voice), which the mic mute leaves alone.
+    bool FromTelephony() const;
     // True when the stream plays into the built-in speaker and nothing else.
     bool OnSpeakerOnly() const;
     ::android::status_t TransferOutput(void* buffer, size_t frame_count, int32_t* latency_ms);

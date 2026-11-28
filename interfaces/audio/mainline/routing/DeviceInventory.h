@@ -67,6 +67,8 @@ class DeviceInventory {
     void ProbeCapabilities();
     void FilterCapabilities();
     void AssignRoles();
+    // Drops the telephony endpoints unless enabled and both directions exist.
+    void KeepTelephonyIfComplete(bool enabled);
     void AddNullEndpointsIfNeeded(bool null_mic);
     void FinalizeEndpoints();
 

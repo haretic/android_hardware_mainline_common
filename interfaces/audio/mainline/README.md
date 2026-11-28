@@ -120,6 +120,8 @@ starts.
 | `primary_card`            | string | *(auto)* | Card that provides "Speaker" and "Built-In Mic". Auto: first card with an analog output. |
 | `include_usb_cards`       | bool   | `false` | Treat USB cards present at boot as static cards instead of leaving them to the framework's USB handling. |
 | `null_mic`                | bool   | `false` | Expose a silent built-in mic when no capture path exists (bring-up only). Without it, no built-in mic is declared unless a capture path is found. |
+| `telephony`               | bool   | `true`  | Expose the telephony ports when the primary card's UCM profile has a telephony device (see Telephony below). |
+| `telephony.property`      | string | *(none)* | Property the call's audio route is published in, for whatever drives the modem's voice: `off`, `codec` or `bridge`, with the voice volume (0 to 1) in `<property>.volume` and the mic mute in `<property>.mute`. |
 | `ucm.enabled`             | bool   | `true`  | Use UCM profiles when available. |
 | `ucm.verb`                | string | `HiFi`  | UCM verb to select (falls back to the first verb of the profile). |
 | `mixer.init`              | bool   | `true`  | For cards *without* a UCM profile and for USB cards: unmute and set default volumes at start-up. |
@@ -251,6 +253,24 @@ When those properties leave only high resolution formats (or rates), the
 
 Multichannel PCM data is reordered from Android's `FL FR FC LFE BL BR (SL SR)`
 to ALSA's `FL FR BL BR FC LFE (SL SR)` for 5.1 / 7.1.
+
+### Telephony
+
+A modem's voice is a UCM device of the primary card whose name starts with
+`Telephony`, `Modem` or `VoiceCall`, with a `PlaybackPCM` (the call's uplink) and
+a `CapturePCM` (its downlink). It becomes the `Telephony Tx` and `Telephony Rx`
+device ports, each with a mix port of its own (`telephony tx`, `telephony rx`),
+and `ITelephony` is served. Both directions are needed, or neither is declared.
+
+Routes from `Telephony Rx` to the card's outputs and from its inputs to
+`Telephony Tx` tell the policy that a call to those devices is bridged in
+hardware: it makes device to device patches, for which the HAL enables the
+devices' UCM entries and reports `codec`. Whoever drives the modem then joins
+its voice to them inside the card. A call to any other device (Bluetooth, USB)
+goes through the mix ports, AudioFlinger bridging in software, and is reported
+as `bridge` once the modem's downlink is captured. The uplink's mix port alone
+is not taken for a call, as the policy keeps it patched at all times, and a
+route is reported in the `IN_CALL` mode only.
 
 ## Streams
 

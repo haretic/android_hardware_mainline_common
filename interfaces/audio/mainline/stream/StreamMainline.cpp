@@ -346,6 +346,11 @@ void StreamMainline::ReopenDeferredPcms() {
     }
 }
 
+bool StreamMainline::FromTelephony() const {
+    return !active_endpoints_.empty() &&
+           active_endpoints_.front().role == routing::DeviceRole::kTelephonyRx;
+}
+
 bool StreamMainline::OnSpeakerOnly() const {
     return active_endpoints_.size() == 1 && !active_endpoints_.front().IsNull() &&
            active_endpoints_.front().device.type.type == AudioDeviceType::OUT_SPEAKER;
@@ -543,7 +548,9 @@ void StreamMainline::ApplyPendingEndpoints() {
     }
     alsa::ReorderChannelsAlsaToAndroid(buffer, frame_count, channel_count_, *alsa_format_,
                                        getContext().getChannelLayout());
-    if (deps_.mic_muted != nullptr && deps_.mic_muted->load(std::memory_order_relaxed)) {
+    // The mic mute is the user's voice, not the other end of a call
+    if (deps_.mic_muted != nullptr && deps_.mic_muted->load(std::memory_order_relaxed) &&
+        !FromTelephony()) {
         std::memset(buffer, 0, frame_count * frame_size_bytes_);
     }
     *latency_ms = pcm.LatencyMs();

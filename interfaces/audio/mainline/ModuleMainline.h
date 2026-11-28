@@ -6,8 +6,11 @@
 #pragma once
 
 #include <atomic>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <set>
 #include <vector>
 
 #include <core-impl/Module.h>
@@ -20,6 +23,8 @@
 #include "routing/PcmArbiter.h"
 #include "routing/RoutingController.h"
 #include "stream/StreamMainline.h"
+#include "telephony/CallState.h"
+#include "telephony/TelephonyMainline.h"
 
 namespace aidl::android::hardware::audio::core::mainline {
 
@@ -49,6 +54,9 @@ class ModuleMainline final : public Module {
     ndk::ScopedAStatus setMicMute(bool in_mute) override;
     ndk::ScopedAStatus getSupportedPlaybackRateFactors(
             SupportedPlaybackRateFactors* _aidl_return) override;
+    ndk::ScopedAStatus setAudioPatch(const AudioPatch& in_requested,
+                                     AudioPatch* _aidl_return) override;
+    ndk::ScopedAStatus resetAudioPatch(int32_t in_patchId) override;
     ndk::ScopedAStatus setAudioPortConfig(
             const ::aidl::android::media::audio::common::AudioPortConfig& in_requested,
             ::aidl::android::media::audio::common::AudioPortConfig* out_suggested,
@@ -98,6 +106,22 @@ class ModuleMainline final : public Module {
     // setAudioPortConfig().
     void CompletePassthroughProbe(::aidl::android::media::audio::common::AudioPortConfig* request);
 
+    // A call's patch: in hardware (device to device) it holds the routing of
+    // the card's devices it joins to the modem, as a stream would.
+    struct CallPatch {
+        bool in_hardware = false;
+        // From the modem (the downlink) rather than to it
+        bool from_modem = false;
+        std::vector<const routing::Endpoint*> held;
+    };
+    // The device ports of the telephony endpoints, empty without a modem.
+    std::set<int32_t> FindTelephonyDevicePorts() const;
+    // Gives the device port configs of a device to device call patch the PCM
+    // configuration Module sizes a patch's buffer from, when they have none.
+    void CompleteDevicePortConfigs(const AudioPatch& patch);
+    // Publishes the route the call patches make.
+    void UpdateCallRoute();
+
     const Properties properties_;
     const std::shared_ptr<routing::DeviceInventory> inventory_;
     const std::shared_ptr<routing::RoutingController> routing_;
@@ -111,6 +135,12 @@ class ModuleMainline final : public Module {
     const std::vector<passthrough::EncodedFormat> forced_passthrough_formats_;
     // 0 without the "hdmi passthrough" mix port.
     const int32_t passthrough_port_id_;
+    const std::set<int32_t> telephony_device_ports_;
+    const std::shared_ptr<telephony::CallState> call_;
+    // Null without a modem.
+    const std::shared_ptr<telephony::TelephonyMainline> telephony_;
+    std::mutex call_lock_;
+    std::map<int32_t, CallPatch> call_patches_;  // By patch id, under call_lock_.
 };
 
 }  // namespace aidl::android::hardware::audio::core::mainline

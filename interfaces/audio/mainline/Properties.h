@@ -42,6 +42,18 @@ struct Properties {
     // useful for bring-up; normally do not advertise nonexistent hardware.
     bool null_mic = false;
 
+    // Use a UCM device named "Telephony" (or "Modem", "Voice Call"), whose
+    // playback PCM goes to a modem's voice and capture PCM comes from it, for
+    // the "Telephony Tx" / "Telephony Rx" ports of calls.
+    bool telephony = true;
+
+    // A property to set to a call's audio: "off", "codec" (the call bridged in
+    // hardware to the modem's card), "bridge" (through the telephony PCMs, by
+    // AudioFlinger); <property>.volume gets the voice volume (0 to 1),
+    // <property>.mute the mic mute (0 / 1). For whatever drives the modem's
+    // voice. Empty: none.
+    std::string telephony_property;
+
     // Use the ALSA Use Case Manager (alsa-ucm-conf) to discover and route
     // devices when a profile exists for the card.
     bool ucm_enabled = true;

@@ -272,6 +272,10 @@ std::unique_ptr<Configuration> BuildConfiguration(DeviceInventory& inventory,
     std::vector<const Endpoint*> input_endpoints;
     std::vector<const Endpoint*> hires_endpoints;
     std::vector<const Endpoint*> multichannel_endpoints;
+    // The modem's voice, which no stream of the other mix ports may reach
+    const Endpoint* telephony_tx = nullptr;
+    const Endpoint* telephony_rx = nullptr;
+    std::vector<const Endpoint*> card_endpoints;
 
     for (Endpoint& endpoint : inventory.mutable_endpoints()) {
         endpoint.port_id = c->nextPortId++;
@@ -283,7 +287,12 @@ std::unique_ptr<Configuration> BuildConfiguration(DeviceInventory& inventory,
         } else {
             c->initialConfigs.push_back(MakeDynamicPortConfig(port));
         }
-        if (endpoint.is_input) {
+        card_endpoints.push_back(&endpoint);
+        if (endpoint.role == DeviceRole::kTelephonyTx) {
+            telephony_tx = &endpoint;
+        } else if (endpoint.role == DeviceRole::kTelephonyRx) {
+            telephony_rx = &endpoint;
+        } else if (endpoint.is_input) {
             input_device_ports.push_back(port.id);
             input_endpoints.push_back(&endpoint);
         } else {
@@ -425,6 +434,44 @@ std::unique_ptr<Configuration> BuildConfiguration(DeviceInventory& inventory,
     AudioPort usb_in = MakeMixPort(c->nextPortId++, kUsbInputMixPort, true, 0, 0, 1, {});
     c->routes.push_back(MakeRoute(usb_input_ports, usb_in.id));
     c->ports.push_back(std::move(usb_in));
+
+    // --- Telephony ------------------------------------------------------------
+    // The policy bridges a call in hardware (a patch from device to device, no
+    // stream) when there is a route between the telephony port and the device,
+    // that is for the devices of the modem's own card; AudioFlinger bridges it
+    // through the telephony mix ports to anything else.
+    if (telephony_tx != nullptr && telephony_rx != nullptr) {
+        AudioPort tx = MakeMixPort(c->nextPortId++, kTelephonyTxMixPort, false, 0, 1, 1,
+                                   alsa::ProfilesFromCapabilities(
+                                           OrFallback(IntersectCapabilities({telephony_tx}, 1, 2),
+                                                      kTelephonyTxMixPort, false, 1, 2),
+                                           false));
+        c->routes.push_back(MakeRoute({tx.id}, telephony_tx->port_id));
+        c->ports.push_back(std::move(tx));
+        AudioPort rx = MakeMixPort(c->nextPortId++, kTelephonyRxMixPort, true, 0, 1, 1,
+                                   alsa::ProfilesFromCapabilities(
+                                           OrFallback(IntersectCapabilities({telephony_rx}, 1, 2),
+                                                      kTelephonyRxMixPort, true, 1, 2),
+                                           true));
+        c->routes.push_back(MakeRoute({telephony_rx->port_id}, rx.id));
+        c->ports.push_back(std::move(rx));
+
+        std::vector<int32_t> call_sources;
+        for (const Endpoint* e : card_endpoints) {
+            if (e->card != telephony_rx->card || e->IsNull() || IsTelephonyRole(e->role)) continue;
+            if (e->is_input) {
+                call_sources.push_back(e->port_id);
+            } else {
+                c->routes.push_back(MakeRoute({telephony_rx->port_id}, e->port_id));
+                LOG(INFO) << __func__ << ": call downlink to \"" << e->name << "\" in hardware";
+            }
+        }
+        if (!call_sources.empty()) {
+            c->routes.push_back(MakeRoute(call_sources, telephony_tx->port_id));
+        }
+        LOG(INFO) << __func__ << ": telephony on card " << telephony_rx->card << ", "
+                  << call_sources.size() << " call uplink source(s) in hardware";
+    }
 
     c->portConfigs.insert(c->portConfigs.end(), c->initialConfigs.begin(), c->initialConfigs.end());
 
